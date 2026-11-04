@@ -8,6 +8,7 @@ class MessageSourceSchema(BaseModel):
     id: UUID
     message_id: UUID
     document_id: UUID
+    filename: Optional[str] = None
     page_number: Optional[int] = None
     relevance_score: Optional[float] = None
     excerpt: Optional[str] = None
@@ -16,16 +17,19 @@ class MessageSourceSchema(BaseModel):
 
 class MessageBase(BaseModel):
     role: MessageRole
-    content: str = Field(..., min_length=1, max_length=32000)
+    content: str = Field(default="", max_length=32000)
 
-class MessageCreate(MessageBase):
-    pass
+class MessageCreate(BaseModel):
+    role: MessageRole
+    content: str = Field(..., min_length=1, max_length=32000)
+    model: Optional[str] = None
 
 class MessageResponse(MessageBase):
     id: UUID
     chat_id: UUID
     answer_type: Optional[AnswerType] = None
     created_at: datetime
+    feedback_rating: Optional[int] = None
     sources: List[MessageSourceSchema] = []
     
     model_config = ConfigDict(from_attributes=True)

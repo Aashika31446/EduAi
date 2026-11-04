@@ -1,6 +1,7 @@
 import json
 import asyncio
-from typing import List, Dict, Any
+import re
+from typing import List, Dict, Any, Optional
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -73,6 +74,7 @@ class ThinkFilter:
 from sqlalchemy.orm import selectinload
 
 @router.get("/", response_model=List[MessageResponse])
+@router.get("", include_in_schema=False, response_model=List[MessageResponse])
 async def get_messages(
     chat_id: str,
     db: AsyncSession = Depends(get_db),
@@ -89,11 +91,15 @@ async def get_messages(
     result = await db.execute(
         select(Message)
         .where(Message.chat_id == chat_id)
-        .options(selectinload(Message.sources))
+        .options(
+            selectinload(Message.sources).selectinload(MessageSource.document),
+            selectinload(Message.feedback)
+        )
         .order_by(Message.created_at.asc())
     )
-    messages = result.scalars().all()
-    
+    raw_messages = result.scalars().all()
+    # Filter out empty messages (e.g. from aborted or interrupted generation)
+    messages = [m for m in raw_messages if m.content and m.content.strip()]
     return messages
 
 async def generate_chat_stream(
@@ -101,7 +107,8 @@ async def generate_chat_stream(
     chat_id: str,
     user_id: str,
     query: str,
-    history: List[Dict[str, str]]
+    history: List[Dict[str, str]],
+    model_override: Optional[str] = None
 ):
     """Generator for StreamingResponse."""
     
@@ -118,36 +125,28 @@ async def generate_chat_stream(
 
     # 2. RAG Pipeline
     try:
-        # Fetch the most recent document's filename in the chat to prioritize it if the user query is vague
-        latest_doc_filename = ""
-        async with db_session_factory() as db:
-            from app.models.document import Document
-            doc_res = await db.execute(
-                select(Document)
-                .where(Document.chat_id == chat_id)
-                .order_by(Document.created_at.desc())
-                .limit(1)
-            )
-            latest_doc = doc_res.scalars().first()
-            if latest_doc:
-                latest_doc_filename = latest_doc.filename
-
-        # Embed query
-        query_vector = await embed_query(query)
-        
-        # Retrieve chunks from Qdrant
-        search_query = query
-        if latest_doc_filename and latest_doc_filename.lower() not in query.lower():
-            # Append filename to internal retrieval query to trigger explicit filename matching
-            search_query = f"{query} {latest_doc_filename}"
+        # Embed query and retrieve multi-document chunks
+        try:
+            query_vector = await embed_query(query)
             
-        retrieved_chunks = await retrieve_chunks(user_id=str(user_id), chat_id=str(chat_id), query_vector=query_vector, query=search_query, top_k=20)
-        
-        # Rerank chunks
-        top_chunks = await rerank_chunks(query=query, chunks=retrieved_chunks, top_n=5)
+            # Retrieve chunks across all uploaded documents in this chat
+            retrieved_chunks = await retrieve_chunks(
+                user_id=str(user_id), 
+                chat_id=str(chat_id), 
+                query_vector=query_vector, 
+                query=query, 
+                top_k=30
+            )
+            
+            # Multi-document fair balancing and generous context window (top_n=15)
+            top_chunks = await rerank_chunks(query=query, chunks=retrieved_chunks, top_n=15)
+        except Exception as rag_err:
+            import logging
+            logging.getLogger(__name__).warning(f"RAG retrieval warning, falling back to general knowledge: {rag_err}")
+            top_chunks = []
         
         # Fetch user settings for model, temperature & language
-        user_model = "llama-3.3-70b-versatile"
+        user_model = "openai/gpt-oss-120b"
         user_temp = 0.2
         user_lang = "en"
         async with db_session_factory() as db:
@@ -162,54 +161,105 @@ async def generate_chat_stream(
                 if u_settings.language:
                     user_lang = u_settings.language.value if hasattr(u_settings.language, 'value') else str(u_settings.language)
 
-        # Allowlist of valid Groq model identifiers — prevents LLM model injection
+        # If a model override is sent from the chat interface, use it and update user preference
+        if model_override and str(model_override).strip():
+            user_model = str(model_override).strip()
+            try:
+                async with db_session_factory() as db_update:
+                    s_res = await db_update.execute(select(UserSettings).where(UserSettings.user_id == user_id))
+                    u_set = s_res.scalars().first()
+                    if u_set:
+                        u_set.llm_model = user_model
+                        await db_update.commit()
+            except Exception as set_err:
+                import logging
+                logging.getLogger(__name__).warning(f"Could not persist user model selection: {set_err}")
+
+        # Allowlist of valid Groq model identifiers on this environment
         ALLOWED_GROQ_MODELS = {
-            "llama-3.3-70b-versatile",
-            "llama-3.1-8b-instant",
-            "deepseek-r1-distill-llama-70b",
-            "gemma2-9b-it",
+            "openai/gpt-oss-120b",
+            "openai/gpt-oss-20b",
+            "qwen/qwen3.6-27b",
+            "qwen/qwen3.8-27b",
         }
         # Map legacy/UI model names to valid Groq models
         GROQ_MODEL_MAP = {
-            "qwen/qwen3.6-27b": "llama-3.3-70b-versatile",
-            "openai/gpt-oss-120b": "llama-3.3-70b-versatile",
-            "openai/gpt-oss-20b": "llama-3.1-8b-instant",
+            # Active native Groq models
+            "openai/gpt-oss-120b": "openai/gpt-oss-120b",
+            "openai/gpt-oss-20b": "openai/gpt-oss-20b",
+            "qwen/qwen3.6-27b": "qwen/qwen3.8-27b",
+            "qwen/qwen3.8-27b": "qwen/qwen3.8-27b",
+            "gpt-oss-120b": "openai/gpt-oss-120b",
+            "gpt-oss-20b": "openai/gpt-oss-20b",
+            "qwen3.8-27b": "qwen/qwen3.8-27b",
+            "claude-sonnet-4.6": "openai/gpt-oss-120b",
+            "claude-opus-4.6": "openai/gpt-oss-120b",
+            # Legacy aliases
+            "llama-3.3-70b-versatile": "openai/gpt-oss-120b",
+            "llama-3.1-8b-instant": "openai/gpt-oss-20b",
+            "deepseek-r1-distill-llama-70b": "qwen/qwen3.8-27b",
+            "gemma2-9b-it": "openai/gpt-oss-20b",
+            "gemma-2-9b-it": "openai/gpt-oss-20b",
         }
-        resolved_groq_model = GROQ_MODEL_MAP.get(user_model, user_model)
-        # Fall back to a safe default if the resolved model is not in the allowlist
-        if resolved_groq_model not in ALLOWED_GROQ_MODELS:
-            resolved_groq_model = "llama-3.3-70b-versatile"
+
+        # Check if any retrieved chunks actually match the query with meaningful relevance (>= 0.60)
+        # If all chunks are below 0.60, the query is a General Knowledge question (not grounded in documents).
+        RELEVANCE_THRESHOLD = 0.60
+        has_document_match = any(getattr(c, "score", 0.0) >= RELEVANCE_THRESHOLD for c in top_chunks)
+        prompt_chunks = top_chunks if has_document_match else []
 
         # Build prompt with user language preference
-        messages = build_prompt(query=query, context_chunks=top_chunks, history=history, language=user_lang)
+        messages = build_prompt(query=query, context_chunks=prompt_chunks, history=history, language=user_lang)
 
-        # 3. Stream from Groq API (with automatic fallback if model is rate limited)
-        try:
-            stream = await groq_client.chat.completions.create(
-                messages=messages,
-                model=resolved_groq_model,
-                temperature=user_temp,
-                max_tokens=2048,
-                stream=True
-            )
-        except Exception as groq_err:
-            import logging
-            logging.getLogger(__name__).warning(f"Groq API failed ({groq_err}). Falling back to Gemini Flash...")
-            
-            if not settings.GEMINI_API_KEY:
-                raise Exception(f"Groq failed ({groq_err}) and no Gemini fallback API key provided.")
+        # 3. Stream from selected provider (Gemini or Groq)
+        is_gemini_family = user_model.lower().startswith("gemini")
+        if is_gemini_family:
+            try:
+                from google import genai
+                gemini_client = genai.Client(api_key=settings.GEMINI_API_KEY)
+                gemini_prompt = "\n".join([f"{m['role'].upper()}: {m['content']}" for m in messages])
+                stream = gemini_client.aio.models.generate_content_stream(
+                    model='gemini-3.6-flash',
+                    contents=gemini_prompt
+                )
+            except Exception as gemini_err:
+                import logging
+                logging.getLogger(__name__).warning(f"Gemini API failed ({gemini_err}). Falling back to Groq...")
+                stream = await groq_client.chat.completions.create(
+                    messages=messages,
+                    model="openai/gpt-oss-120b",
+                    temperature=user_temp,
+                    max_tokens=2048,
+                    stream=True
+                )
+        else:
+            resolved_groq_model = GROQ_MODEL_MAP.get(user_model, "openai/gpt-oss-120b")
+            if resolved_groq_model not in ALLOWED_GROQ_MODELS:
+                resolved_groq_model = "openai/gpt-oss-120b"
+
+            try:
+                stream = await groq_client.chat.completions.create(
+                    messages=messages,
+                    model=resolved_groq_model,
+                    temperature=user_temp,
+                    max_tokens=2048,
+                    stream=True
+                )
+            except Exception as groq_err:
+                import logging
+                logging.getLogger(__name__).warning(f"Groq API failed ({groq_err}). Falling back to Gemini Flash...")
                 
-            from google import genai
-            gemini_client = genai.Client(api_key=settings.GEMINI_API_KEY)
-            
-            # Format messages for Gemini (it prefers a single prompt string if we aren't doing strict multi-turn parts)
-            gemini_prompt = "\n".join([f"{m['role'].upper()}: {m['content']}" for m in messages])
-            
-            # Use the asynchronous client under .aio (do NOT await the generator creation)
-            stream = gemini_client.aio.models.generate_content_stream(
-                model='gemini-3.6-flash',
-                contents=gemini_prompt
-            )
+                if not settings.GEMINI_API_KEY:
+                    raise Exception(f"Groq failed ({groq_err}) and no Gemini fallback API key provided.")
+                    
+                from google import genai
+                gemini_client = genai.Client(api_key=settings.GEMINI_API_KEY)
+                gemini_prompt = "\n".join([f"{m['role'].upper()}: {m['content']}" for m in messages])
+                stream = gemini_client.aio.models.generate_content_stream(
+                    model='gemini-3.6-flash',
+                    contents=gemini_prompt
+                )
+
 
         full_response = ""
         think_filter = ThinkFilter()
@@ -237,25 +287,63 @@ async def generate_chat_stream(
             payload = json.dumps({"type": "token", "text": final_text})
             yield f"data: {payload}\n\n"
                     
-        # Determine answer type directly from retrieved chunks
-        answer_type = AnswerType.document if top_chunks else AnswerType.general
-        
-        # If chunks were provided but the AI did NOT cite a source, it means it used general knowledge.
-        if top_chunks and "source:" not in full_response.lower():
-            answer_type = AnswerType.general
-            top_chunks = []
+        # Determine answer type: only 'document' if we actually had relevant document matches
+        answer_type = AnswerType.document if has_document_match else AnswerType.general
 
-        # Construct sources for DB and client
+        def sanitize_excerpt(text: str, max_length: int = 400) -> str:
+            if not text:
+                return ""
+            # Strip bracketed parser headers: [Page 1 Visual Content & Text: ...], [Uploaded Image Content: ...]
+            cleaned = re.sub(r"^\[(?:Page\s*\d+[^\n\]]*|Image\s*\d+[^\n\]]*|Uploaded\s*Image\s*Content)[^:\n]*:?\s*", "", text, flags=re.IGNORECASE)
+            # Strip markdown headers like ### Verbatim Text Extraction
+            cleaned = re.sub(r"#{1,6}\s*(?:Verbatim\s*Text\s*Extraction|Extracted\s*Text|Visual\s*Diagram\s*Description)[:\s]*\n*", "", cleaned, flags=re.IGNORECASE)
+            # Strip page dividers like --- Page 1 ---
+            cleaned = re.sub(r"^---\s*Page\s*\d+\s*---\s*", "", cleaned, flags=re.IGNORECASE)
+            # Strip decorative logo remarks
+            cleaned = re.sub(r"\(Logo:[^\)]*\)", "", cleaned, flags=re.IGNORECASE)
+            # Clean standalone brackets
+            cleaned = re.sub(r"^\[\s*", "", cleaned)
+            if cleaned.endswith("]"):
+                cleaned = cleaned[:-1].strip()
+            cleaned = cleaned.strip()
+            if len(cleaned) <= max_length:
+                return cleaned
+            # Break cleanly at last space
+            truncated = cleaned[:max_length]
+            last_space = truncated.rfind(" ")
+            if last_space > int(max_length * 0.7):
+                truncated = truncated[:last_space]
+            return truncated.strip() + "..."
+
+        # Construct sources for DB and client: ONLY include chunks meeting the relevance threshold
         sources_payload = []
-        for i, chunk in enumerate(top_chunks):
-            p = chunk.payload
-            sources_payload.append({
-                "document_id": p.get("document_id"),
-                "filename": p.get("filename"),
-                "page_number": p.get("page_number"),
-                "excerpt": p.get("text", "")[:200] + "...",
-                "relevance_score": getattr(chunk, "score", 0.0)
-            })
+        if has_document_match:
+            for i, chunk in enumerate(top_chunks):
+                score = getattr(chunk, "score", 0.0)
+                if score < RELEVANCE_THRESHOLD:
+                    continue
+                p = chunk.payload
+                raw_text = p.get("text") or p.get("chunk_text") or ""
+                
+                # Extract page number if not already present in payload
+                page_num = p.get("page_number")
+                if page_num is None:
+                    page_match = re.search(r"(?:\[Page\s*|---\s*Page\s*|Page\s*)(\d+)", raw_text, re.IGNORECASE)
+                    if page_match:
+                        try:
+                            page_num = int(page_match.group(1))
+                        except (ValueError, TypeError):
+                            page_num = None
+
+                cleaned_excerpt = sanitize_excerpt(raw_text, max_length=400)
+
+                sources_payload.append({
+                    "document_id": p.get("document_id"),
+                    "filename": p.get("filename") or "Document",
+                    "page_number": page_num,
+                    "excerpt": cleaned_excerpt,
+                    "relevance_score": score
+                })
 
         # Yield sources payload
         final_payload = json.dumps({
@@ -276,7 +364,7 @@ async def generate_chat_stream(
                 chat_id=chat_id,
                 user_id=user_id,
                 role=MessageRole.assistant,
-                content=full_response,
+                content=full_response.strip() if full_response and full_response.strip() else "*(The model was unable to complete the response. Please try again.)*",
                 answer_type=answer_type
             )
             db.add(assistant_message)
@@ -298,17 +386,25 @@ async def generate_chat_stream(
             chat_obj = chat_result.scalars().first()
             if chat_obj:
                 chat_obj.last_message_at = datetime.now(timezone.utc)
+                if chat_obj.title in ["New Chat", "New Study Session", "Untitled Chat", ""]:
+                    words = query.split()
+                    new_title = " ".join(words[:6])
+                    if len(words) > 6:
+                        new_title += "..."
+                    chat_obj.title = new_title
                 db.add(chat_obj)
 
             await db.commit()
 
     except Exception as e:
-        import traceback
-        traceback.print_exc()
-        error_payload = json.dumps({"error": str(e)})
+        import logging
+        logging.getLogger(__name__).error(f"Chat streaming generation error: {e}", exc_info=True)
+        safe_error_msg = "An error occurred while generating the response. Please try again."
+        error_payload = json.dumps({"error": safe_error_msg})
         yield f"data: {error_payload}\n\n"
 
 @router.post("/")
+@router.post("", include_in_schema=False)
 async def stream_chat(
     chat_id: str,
     message_in: MessageCreate,
@@ -342,7 +438,8 @@ async def stream_chat(
             chat_id=chat_id,
             user_id=current_user.id,
             query=message_in.content,
-            history=history
+            history=history,
+            model_override=message_in.model
         ),
         media_type="text/event-stream",
         headers={
@@ -351,3 +448,55 @@ async def stream_chat(
             "X-Accel-Buffering": "no"
         }
     )
+
+from pydantic import BaseModel
+
+class FeedbackIn(BaseModel):
+    rating: int  # 1 for up, -1 for down, 0 to clear
+    comment: Optional[str] = None
+
+@router.post("/{message_id}/feedback")
+async def submit_feedback(
+    chat_id: str,
+    message_id: str,
+    feedback_in: FeedbackIn,
+    db: AsyncSession = Depends(get_db),
+    current_user: UserProfile = Depends(get_current_user)
+):
+    """Save or update thumbs up/down feedback for an assistant message."""
+    # Validate chat ownership
+    chat_res = await db.execute(select(Chat).where(Chat.id == chat_id, Chat.user_id == current_user.id))
+    if not chat_res.scalars().first():
+        raise HTTPException(status_code=404, detail="Chat not found")
+
+    msg_res = await db.execute(select(Message).where(Message.id == message_id, Message.chat_id == chat_id))
+    msg = msg_res.scalars().first()
+    if not msg:
+        raise HTTPException(status_code=404, detail="Message not found")
+
+    from app.models.message import Feedback
+    fb_res = await db.execute(
+        select(Feedback).where(Feedback.message_id == message_id, Feedback.user_id == current_user.id)
+    )
+    existing_fb = fb_res.scalars().first()
+
+    if feedback_in.rating == 0:
+        if existing_fb:
+            await db.delete(existing_fb)
+            await db.commit()
+        return {"status": "cleared"}
+
+    if existing_fb:
+        existing_fb.rating = feedback_in.rating
+        existing_fb.comment = feedback_in.comment
+    else:
+        new_fb = Feedback(
+            message_id=msg.id,
+            user_id=current_user.id,
+            rating=feedback_in.rating,
+            comment=feedback_in.comment
+        )
+        db.add(new_fb)
+
+    await db.commit()
+    return {"status": "ok", "rating": feedback_in.rating}

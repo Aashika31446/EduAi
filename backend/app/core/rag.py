@@ -1,10 +1,11 @@
-import logging
 import asyncio
-from typing import List, Dict, Any, Optional
-from qdrant_client.models import Filter, FieldCondition, MatchValue
+import logging
 from groq import AsyncGroq
 from app.core.config import settings
+from typing import List, Dict, Any, Optional
 from app.core.qdrant import qdrant_client, COLLECTION_NAME
+from qdrant_client.models import Filter, FieldCondition, MatchValue
+from qdrant_client.http.models import ScoredPoint
 
 logger = logging.getLogger(__name__)
 
@@ -34,8 +35,11 @@ async def embed_query(query: str) -> List[float]:
     )
     return response.embeddings[0].values
 
-async def retrieve_chunks(user_id: str, chat_id: str, query_vector: List[float], query: str = "", top_k: int = 20) -> List[Any]:
-    """Retrieve top chunks from Qdrant strictly filtered by user_id and chat_id."""
+async def retrieve_chunks(user_id: str, chat_id: str, query_vector: List[float], query: str = "", top_k: int = 30) -> List[Any]:
+    """
+    Retrieve top chunks from Qdrant strictly filtered by user_id and chat_id.
+    Ensures multi-document awareness so all uploaded documents in the chat are accessible.
+    """
     points = await qdrant_client.search(
         collection_name=COLLECTION_NAME,
         query_vector=query_vector,
@@ -49,60 +53,609 @@ async def retrieve_chunks(user_id: str, chat_id: str, query_vector: List[float],
         with_payload=True
     )
     
-    # If the user query specifically mentions an uploaded filename, include its chunks explicitly
-    if query:
-        try:
-            scroll_res = await qdrant_client.scroll(
-                collection_name=COLLECTION_NAME,
-                scroll_filter=Filter(
-                    must=[
-                        FieldCondition(key="user_id", match=MatchValue(value=user_id)),
-                        FieldCondition(key="chat_id", match=MatchValue(value=chat_id))
-                    ]
-                ),
-                limit=100,
-                with_payload=True
-            )
+    # Retrieve all points for this chat to guarantee complete multi-document coverage and synonym matching
+    try:
+        scroll_res = await qdrant_client.scroll(
+            collection_name=COLLECTION_NAME,
+            scroll_filter=Filter(
+                must=[
+                    FieldCondition(key="user_id", match=MatchValue(value=user_id)),
+                    FieldCondition(key="chat_id", match=MatchValue(value=chat_id))
+                ]
+            ),
+            limit=100,
+            with_payload=True
+        )
+        all_chat_points = scroll_res[0] if scroll_res else []
+        
+        if all_chat_points:
+            existing_ids = set(p.id for p in points)
+            query_lower = query.lower()
             
-            user_filenames = set(p.payload.get("filename") for p in scroll_res[0] if p.payload.get("filename"))
-            mentioned_files = [fn for fn in user_filenames if fn.lower() in query.lower()]
+            # Common document type synonyms
+            # -----------------------------------------
+
+            RESUME_TERMS = {
+                # Resume / CV
+                "resume","resumé","cv","curriculum vitae","curriculum","bio","biography",
+                "profile","professional profile","career profile","candidate profile",
+
+                # Experience
+                "experience","work experience","employment","employment history",
+                "work history","professional experience","career history","job history",
+                "internship","internships","internship experience",
+
+                # Education
+                "education","educational background","academic background","academic history",
+                "qualification","qualifications","academic qualification","educational qualification",
+                "degree","degrees","university","college","school",
+
+                # Skills
+                "skill",
+                "skills",
+                "technical skills",
+                "soft skills",
+                "core skills",
+                "key skills",
+                "competencies",
+                "competence",
+                "expertise",
+                "technical expertise",
+                "professional skills",
+                "programming skills",
+                "technical knowledge",
+
+                # Projects
+                "project",
+                "projects",
+                "academic project",
+                "academic projects",
+                "personal project",
+                "personal projects",
+                "professional project",
+                "portfolio project",
+                "project experience",
+
+                # Career
+                "career",
+                "career objective",
+                "objective",
+                "career summary",
+                "professional summary",
+                "profile summary",
+                "summary",
+                "about me",
+
+                # Achievements
+                "achievement",
+                "achievements",
+                "accomplishment",
+                "accomplishments",
+                "awards",
+                "award",
+                "honors",
+                "honours",
+                "recognition",
+
+                # Other resume sections
+                "contact",
+                "contact information",
+                "personal details",
+                "personal information",
+                "email",
+                "phone",
+                "linkedin",
+                "github",
+                "portfolio",
+                "publications",
+                "publication",
+                "research",
+                "research experience",
+                "volunteering",
+                "volunteer experience",
+                "extracurricular",
+                "extracurricular activities",
+                "languages",
+                "interests",
+                "hobbies",
+                "references",
+            }
+
+
+            CERT_TERMS = {
+                # Certificate
+                "certificate",
+                "certificates",
+                "certification",
+                "certifications",
+                "cert",
+                "credential",
+                "credentials",
+                "certificate of completion",
+                "certificate of achievement",
+                "completion certificate",
+                "professional certificate",
+                "course certificate",
+
+                # Courses
+                "course",
+                "courses",
+                "online course",
+                "online courses",
+                "training",
+                "trainings",
+                "training program",
+                "bootcamp",
+                "boot camp",
+                "workshop",
+                "workshops",
+                "program",
+                "learning program",
+
+                # Education credentials
+                "degree",
+                "degrees",
+                "diploma",
+                "diplomas",
+                "qualification",
+                "qualifications",
+                "academic credential",
+                "academic credentials",
+
+                # Certificate metadata
+                "certificate id",
+                "certificate number",
+                "credential id",
+                "credential number",
+                "certification id",
+                "certification number",
+                "credential code",
+                "certificate code",
+                "verification code",
+                "verification id",
+                "license number",
+                "license",
+
+                # Common certificate providers
+                "udemy",
+                "coursera",
+                "edx",
+                "linkedin learning",
+                "google certification",
+                "microsoft certification",
+                "aws certification",
+                "ibm certification",
+                "oracle certification",
+                "meta certification",
+                "nptel",
+                "forage",
+                "simplilearn",
+                "great learning",
+                "upgrad",
+                "coding ninjas",
+                "codewithharry",
+
+                # Certificate actions
+                "certified",
+                "certified in",
+                "completed",
+                "completion",
+                "earned",
+                "credentialed",
+                "accredited",
+                "accreditation",
+                "verification",
+                "verify certificate",
+                "verify credential",
+            }
+
+
+            NOTES_TERMS = {
+                # General notes
+                "note",
+                "notes",
+                "study notes",
+                "class notes",
+                "lecture notes",
+                "personal notes",
+                "revision notes",
+                "handwritten notes",
+                "digital notes",
+                "course notes",
+
+                # Study material
+                "study material",
+                "study materials",
+                "study guide",
+                "study guides",
+                "learning material",
+                "learning materials",
+                "reading material",
+                "reference material",
+                "academic material",
+
+                # Academic
+                "lecture",
+                "lectures",
+                "lesson",
+                "lessons",
+                "chapter notes",
+                "topic notes",
+                "subject notes",
+                "unit notes",
+                "semester notes",
+                "classroom notes",
+
+                # Revision
+                "revision",
+                "revision material",
+                "quick revision",
+                "revision guide",
+                "cheat sheet",
+                "formula sheet",
+                "short notes",
+                "summary notes",
+
+                # Questions / preparation
+                "question bank",
+                "question paper",
+                "practice questions",
+                "practice paper",
+                "important questions",
+                "exam notes",
+                "exam preparation",
+                "exam prep",
+                "study plan",
+            }
+
+
+            ASSIGNMENT_TERMS = {
+                "assignment",
+                "assignments",
+                "homework",
+                "task",
+                "tasks",
+                "academic task",
+                "college assignment",
+                "university assignment",
+                "coursework",
+                "course work",
+                "classwork",
+                "class work",
+                "project work",
+                "lab assignment",
+                "practical assignment",
+                "submission",
+                "academic submission",
+                "written assignment",
+                "case study",
+                "case studies",
+                "problem statement",
+                "questions",
+                "answers",
+            }
+
+
+            RESEARCH_TERMS = {
+                "research",
+                "research paper",
+                "research papers",
+                "paper",
+                "papers",
+                "journal",
+                "journal paper",
+                "journal article",
+                "article",
+                "academic paper",
+                "academic article",
+                "publication",
+                "publications",
+                "conference paper",
+                "conference publication",
+                "thesis",
+                "theses",
+                "dissertation",
+                "research report",
+                "literature review",
+                "systematic review",
+                "survey paper",
+                "review paper",
+                "research proposal",
+                "abstract",
+                "methodology",
+                "experiment",
+                "experimental study",
+                "findings",
+                "results",
+                "discussion",
+                "references",
+                "bibliography",
+            }
+
+
+            REPORT_TERMS = {
+                "report",
+                "reports",
+                "project report",
+                "project reports",
+                "technical report",
+                "technical reports",
+                "research report",
+                "research reports",
+                "final report",
+                "progress report",
+                "status report",
+                "internship report",
+                "industrial training report",
+                "academic report",
+                "college report",
+                "university report",
+                "lab report",
+                "laboratory report",
+                "case report",
+                "analysis report",
+                "business report",
+                "project documentation",
+                "documentation",
+            }
+
+
+            PRESENTATION_TERMS = {
+                "presentation",
+                "presentations",
+                "ppt",
+                "pptx",
+                "slides",
+                "slide deck",
+                "deck",
+                "powerpoint",
+                "power point",
+                "presentation slides",
+                "lecture slides",
+                "class slides",
+                "seminar",
+                "seminar presentation",
+                "conference presentation",
+                "pitch deck",
+                "project presentation",
+                "academic presentation",
+            }
+
+
+            RESUME_SECTION_TERMS = {
+                "objective",
+                "summary",
+                "profile",
+                "experience",
+                "education",
+                "skills",
+                "projects",
+                "achievements",
+                "certifications",
+                "awards",
+                "internships",
+                "publications",
+                "research",
+                "volunteering",
+                "languages",
+                "interests",
+                "references",
+                "contact",
+            }
+
+
+            LEGAL_TERMS = {
+                "agreement",
+                "contract",
+                "legal document",
+                "legal agreement",
+                "terms",
+                "terms and conditions",
+                "terms of service",
+                "privacy policy",
+                "policy",
+                "policies",
+                "license agreement",
+                "lease",
+                "rental agreement",
+                "employment agreement",
+                "offer letter",
+                "appointment letter",
+                "nda",
+                "non disclosure agreement",
+                "affidavit",
+                "declaration",
+                "notice",
+                "legal notice",
+                "memorandum",
+                "memorandum of understanding",
+                "mou",
+            }
+
+
+            MANUAL_TERMS = {
+                "manual",
+                "user manual",
+                "user guide",
+                "guide",
+                "guidelines",
+                "instruction",
+                "instructions",
+                "documentation",
+                "technical documentation",
+                "reference guide",
+                "handbook",
+                "employee handbook",
+                "installation guide",
+                "setup guide",
+                "configuration guide",
+                "developer guide",
+                "administration guide",
+                "operating instructions",
+                "standard operating procedure",
+                "sop",
+            }
+
+
+            BOOK_TERMS = {
+                "book",
+                "textbook",
+                "ebook",
+                "e-book",
+                "novel",
+                "chapter",
+                "chapters",
+                "reference book",
+                "academic book",
+                "course textbook",
+                "study book",
+                "workbook",
+                "reference material",
+            }
+
+
+            SYLLABUS_TERMS = {
+                "syllabus",
+                "course syllabus",
+                "curriculum",
+                "course curriculum",
+                "course outline",
+                "course structure",
+                "subject outline",
+                "academic syllabus",
+                "semester syllabus",
+                "unit",
+                "units",
+                "course objectives",
+                "learning objectives",
+                "learning outcomes",
+                "course outcomes",
+                "topics",
+                "course topics",
+                "modules",
+                "course modules",
+            }
+
+
+            JOB_DESCRIPTION_TERMS = {
+                "job description",
+                "job descriptions",
+                "jd",
+                "job posting",
+                "job post",
+                "job listing",
+                "vacancy",
+                "vacancies",
+                "opening",
+                "job opening",
+                "position",
+                "role",
+                "responsibilities",
+                "job responsibilities",
+                "requirements",
+                "qualifications required",
+                "required skills",
+                "preferred skills",
+                "eligibility",
+                "eligibility criteria",
+                "experience required",
+                "technical requirements",
+                "job profile",
+            }
             
-            if mentioned_files:
-                existing_ids = set(p.id for p in points)
-                for fn in mentioned_files:
-                    # Filter locally from the already fetched scroll_res
-                    file_points = [p for p in scroll_res[0] if p.payload.get("filename") == fn]
-                    for fp in file_points:
-                        if fp.id not in existing_ids:
-                            # Convert Record to ScoredPoint so it has a score attribute
-                            from qdrant_client.http.models import ScoredPoint
-                            sp = ScoredPoint(
-                                id=fp.id,
-                                version=0,
-                                score=1.0,
-                                payload=fp.payload,
-                                vector=fp.vector
-                            )
-                            points.append(sp)
-                            existing_ids.add(fp.id)
-        except Exception as e:
-            logger.error(f"Error in filename-aware retrieval: {e}")
+            # Group points by filename
+            by_file: Dict[str, List[Any]] = {}
+            for fp in all_chat_points:
+                fn = fp.payload.get("filename", "")
+                by_file.setdefault(fn, []).append(fp)
+            
+            # Ensure chunks from every document in this chat are represented
+            for fn, fps in by_file.items():
+                fn_lower = fn.lower()
+                
+                # Check whether this document matches user query terms or synonyms
+                is_explicitly_relevant = False
+                
+                # 1. Filename word matching
+                fn_words = [w for w in fn_lower.replace('_', ' ').replace('-', ' ').replace('.', ' ').split() if len(w) > 2]
+                if any(word in query_lower for word in fn_words):
+                    is_explicitly_relevant = True
+                    
+                first_text = (fps[0].payload.get("chunk_text") or "").lower()
+                
+                # 2. Resume intent matching
+                if any(term in query_lower for term in RESUME_TERMS):
+                    if any(t in fn_lower for t in ["resume", "cv"]) or any(k in first_text for k in ["education", "experience", "projects", "skills", "b.tech", "engineer"]):
+                        is_explicitly_relevant = True
+                        
+                # 3. Certificate intent matching
+                if any(term in query_lower for term in CERT_TERMS):
+                    if any(t in fn_lower for t in ["cert", "udemy", "course"]) or any(k in first_text for k in ["certificate", "completion", "hours", "credential", "verify", "reference"]):
+                        is_explicitly_relevant = True
+                        
+                # If there are multiple documents in chat, guarantee each document gets candidate slots
+                sample_count = len(fps) if is_explicitly_relevant else min(4, len(fps))
+                for fp in fps[:sample_count]:
+                    if fp.id not in existing_ids:
+                        score = 0.95 if is_explicitly_relevant else 0.50
+                        points.append(ScoredPoint(
+                            id=fp.id,
+                            version=0,
+                            score=score,
+                            payload=fp.payload,
+                            vector=fp.vector
+                        ))
+                        existing_ids.add(fp.id)
+                        
+    except Exception as e:
+        logger.error(f"Error in multi-document retrieval enhancement: {e}")
 
     return points
 
-async def rerank_chunks(query: str, chunks: List[Any], top_n: int = 5) -> List[Any]:
-    """Return top chunks. Local PyTorch reranking is disabled to stay under 512MB RAM."""
+async def rerank_chunks(query: str, chunks: List[Any], top_n: int = 15) -> List[Any]:
+    """
+    Return top chunks with fair multi-document balancing so no document starves another.
+    """
     if not chunks:
         return []
         
-    # We sort by the Qdrant retrieval score since we aren't using a heavy local reranker
-    chunks.sort(key=lambda x: getattr(x, 'score', 0.0), reverse=True)
-    
-    # Require minimum 0.15 relevance match score for Gemini embeddings
     MIN_RELEVANCE_PROB = 0.15
+    filtered = [p for p in chunks if getattr(p, 'score', 0.0) >= MIN_RELEVANCE_PROB]
+    if not filtered:
+        filtered = chunks
+
+    # Group by filename
+    by_file: Dict[str, List[Any]] = {}
+    for p in filtered:
+        fn = p.payload.get("filename", "unknown")
+        by_file.setdefault(fn, []).append(p)
+
+    # If only 1 file in results, return top_n sorted
+    if len(by_file) <= 1:
+        filtered.sort(key=lambda x: getattr(x, 'score', 0.0), reverse=True)
+        return filtered[:top_n]
+
+    # When multiple files exist, ensure balanced representation
+    for fn in by_file:
+        by_file[fn].sort(key=lambda x: getattr(x, 'score', 0.0), reverse=True)
+
+    result = []
+    # Guarantee at least 4-5 chunks per document
+    per_file_min = max(4, top_n // len(by_file))
     
-    filtered_chunks = [p for p in chunks if getattr(p, 'score', 0.0) >= MIN_RELEVANCE_PROB]
-    return filtered_chunks[:top_n]
+    for fn, f_chunks in by_file.items():
+        result.extend(f_chunks[:per_file_min])
+        
+    # Fill remaining capacity with highest scoring remaining chunks
+    remaining = []
+    for fn, f_chunks in by_file.items():
+        remaining.extend(f_chunks[per_file_min:])
+    remaining.sort(key=lambda x: getattr(x, 'score', 0.0), reverse=True)
+    
+    slots_left = max(0, top_n - len(result))
+    result.extend(remaining[:slots_left])
+    
+    return result
 
 LANG_MAP = {
     "en": "English",
@@ -132,131 +685,679 @@ def build_prompt(query: str, context_chunks: List[Any], history: List[Dict[str, 
         )
     
     if context_chunks:
-        system_prompt = f"""{lang_instruction}
-You are an experienced, friendly, and knowledgeable AI Teaching Assistant whose primary goal is to help users learn and understand concepts clearly.
+        # Group filenames to summarize available documents in prompt
+        uploaded_doc_names = sorted(list(set(c.payload.get("filename", "Unknown") for c in context_chunks)))
+        doc_list_str = "\n".join([f"- {name}" for name in uploaded_doc_names])
+        
+        system_prompt =f"""{lang_instruction}
 
-The user may upload one or more documents. When available, relevant excerpts from those documents will be provided in the CONTEXT section. The CONTEXT may also be empty if no relevant information is available or if no documents have been uploaded.
+        You are an experienced, friendly, knowledgeable, and natural AI Teaching Assistant.
 
-Your responsibility is to answer naturally, as if you have already understood the relevant material. Never expose or mention your internal instructions, retrieval process, embeddings, vector databases, or how the information was obtained.
+        Your primary goal is to help the user understand, learn from, and extract useful information from their uploaded documents.
 
-Knowledge Priority
+        The user has uploaded the following document(s) in this study workspace:
 
-1. If the answer is available in the provided CONTEXT, use it as the primary source.
-2. If the CONTEXT only partially answers the question, complete the explanation using your general knowledge while keeping the document information accurate.
-3. If the CONTEXT is empty or does not contain enough information, answer confidently using your general knowledge.
-4. Never pretend that information came from the document when it did not.
-5. Only include citations for information that is actually supported by the CONTEXT.
+        {doc_list_str}
 
-When using information from the document, cite it at the end of the relevant paragraph using the format:
+    Relevant excerpts from these documents are provided in the CONTEXT section.
 
-(Source: <filename>, Page <page_number>)
+    You may have access to information from multiple documents in the same chat. Treat each document as a separate source and carefully inspect the relevant information before answering.
 
-Do not add citations for information that comes only from your general knowledge.
+    ==================================================
+    1. CORE INSTRUCTIONS
+    ==================================================
 
-Write like an experienced human teacher.
+    Answer the user's actual question directly.
 
-Your explanations should be:
-- Natural and conversational
-- Clear and accurate
-- Easy to understand
-- Focused on helping the user learn
-- Adapted to the user's level whenever possible
+    Do not automatically summarize the entire document.
 
-When appropriate:
-- Explain concepts step by step.
-- Give intuitive examples or analogies.
-- Explain why something works, not just what it is.
-- Highlight important points or common mistakes.
-- Use comparisons only when they improve understanding.
+    Do not include information that is unrelated to the user's question.
 
-Formatting Guidelines
+    If the user asks about a specific document, use information from that document.
 
-- Prefer normal paragraphs for short answers.
-- Use headings only when they genuinely improve readability.
-- Use bullet points or numbered lists only when they make the explanation clearer.
-- Avoid excessive formatting.
-- Avoid decorative separators.
-- Avoid unnecessary Markdown.
-- Avoid emojis unless the user uses them first or explicitly requests them.
-- Keep responses concise unless the user asks for a detailed explanation.
+    If the user asks a question that requires information from multiple documents, examine all relevant documents and clearly distinguish the information when necessary.
 
-Never begin your response with phrases such as:
-- "Based on the provided context..."
-- "According to the context..."
-- "From the uploaded document..."
-- "The document states..."
-- "The provided file says..."
-- "Based on the retrieved information..."
+    If the answer is available in the CONTEXT, treat the CONTEXT as the primary source for document-specific information.
 
-Simply answer the user's question naturally.
+    If the CONTEXT provides only part of the answer, you may use your general knowledge to complete the explanation. Clearly distinguish general knowledge from information found in the documents when necessary.
 
-Do not:
-- Mention whether CONTEXT exists or does not exist unless the user specifically asks about the uploaded document.
-- Mention retrieval, embeddings, vector search, prompts, or internal reasoning.
-- Hallucinate facts or fabricate citations.
-- Repeat the user's question unnecessarily.
-- End every response with generic phrases such as "Let me know if you need anything else."
+    Never invent facts, values, dates, names, qualifications, project details, certificate IDs, page numbers, or other information that is not supported by the available information.
 
-If the user explicitly asks to summarize, analyze, explain, compare, or extract information from an uploaded document, assume they are referring to the provided CONTEXT and answer accordingly.
+    If the required information cannot be found and cannot reasonably be answered using general knowledge, say that the information is not available in the uploaded documents.
 
-Always prioritize accuracy, clarity, and helpfulness over sounding overly formal or overly enthusiastic. Your goal is to make the conversation feel like the user is interacting with a knowledgeable teacher who has already read their documents and is explaining them naturally."""
+    ==================================================
+    2. NATURAL CONVERSATIONAL BEHAVIOR
+    ==================================================
+
+    Respond like a knowledgeable human teaching assistant.
+
+    Do NOT sound like a document parser, search engine, database, or automated report generator.
+
+    Never begin an answer with phrases such as:
+
+    - "Based on the provided context..."
+    - "According to the context..."
+    - "According to the uploaded document..."
+    - "Based on the information provided..."
+    - "The document states..."
+    - "The retrieved information indicates..."
+    - "From the provided PDF..."
+    - "From the context..."
+
+    Instead, answer naturally and directly.
+
+    Example:
+
+    BAD:
+    "Based on the provided context, the candidate has experience in Python."
+
+    GOOD:
+    "The candidate has experience with Python, particularly in AI, machine learning, and data analysis."
+
+    ==================================================
+    3. DOCUMENT QUESTIONS
+    ==================================================
+
+    When the user asks about an uploaded document, answer only the part relevant to the question.
+
+    For example:
+
+    User:
+    "What are the technical skills in my resume?"
+
+    GOOD:
+
+    ### Technical Skills
+
+    - Python
+    - C++
+    - Java
+    - FastAPI
+    - Flask
+    - Scikit-learn
+    - Pandas
+    - NumPy
+    - OpenCV
+    - PostgreSQL
+
+    BAD:
+
+    Do not produce a complete resume report containing:
+
+    | Section | Key Information | Source |
+    | ... |
+
+    unless the user explicitly asks for a structured report or table.
+
+    If the user asks:
+
+    "Tell me about my resume."
+
+    Then provide a concise, well-organized overview of the important sections.
+
+    ==================================================
+    4. FORMATTING RULES & STRUCTURE
+    ==================================================
+
+    Use clean, readable, well-structured Markdown.
+
+    CRITICAL RULES FOR CLEAN STRUCTURE:
+    - NEVER dump an entire response as a single repetitive bulleted list where every line starts with `- **Section Name** - ...`.
+    - When providing an overview or summary of a document, organize it into logical sections using Markdown subheadings (e.g. `### Profile Summary`, `### Education`, `### Core Projects`, `### Technical Skills`).
+    - Under each heading, use natural explanatory sentences or clean, concise bullet points.
+    - Do NOT overuse bold asterisks (`**`). Use bolding purposefully for item names, not for every word or every bullet prefix.
+    - NEVER append trailing source disclaimers like `(Information sourced from the PDF.)` or `(From the uploaded document.)` at the end of responses. The user interface already displays a dedicated grounding badge.
+
+    Preferred formatting elements:
+    - Clear subheadings (`### Section`)
+    - Normal paragraphs for descriptions
+    - Short bullet points when listing items
+    - Numbered lists for sequential projects or steps
+    - Markdown tables ONLY when a table genuinely improves understanding (e.g. comparisons)
+
+    ==================================================
+    5. ABSOLUTELY NO RAW HTML
+    ==================================================
+
+    Never output raw HTML or XML tags.
+
+    Do NOT use:
+
+    <br>
+    <p>
+    <div>
+    <span>
+    <table>
+    <tr>
+    <td>
+    <th>
+    <ul>
+    <ol>
+    <li>
+    <hr>
+
+    or any other HTML tags.
+
+    Never use HTML tags to control spacing or formatting.
+
+    Use Markdown instead.
+
+    BAD:
+
+    Python<br>
+    SQL<br>
+    Machine Learning
+
+    GOOD:
+
+    - Python
+    - SQL
+    - Machine Learning
+
+    ==================================================
+    6. CITATION RULES
+    ==================================================
+
+    When information comes from the uploaded documents, citations may be included using:
+
+    (Source: <filename>, Page <page_number>)
+
+    Place the citation naturally at the end of the relevant paragraph or bullet.
+
+    Example:
+
+    The resume lists Python, C++, and Java as programming languages.
+    (Source: Rakshit_Katiyar_CSAIML.pdf, Page 1)
+
+    IMPORTANT:
+
+    Only generate a citation when the actual filename and page number are available.
+
+    NEVER generate:
+
+    - Page ?
+    - Page unknown
+    - Page N/A
+    - Page None
+    - filename with missing metadata
+    - invented page numbers
+    - invented source names
+
+    If the page number is unavailable, DO NOT create a fake citation.
+
+    Do not expose internal retrieval metadata.
+
+    NEVER display:
+
+    - chunk IDs
+    - document IDs
+    - vector IDs
+    - embedding information
+    - similarity scores
+    - retrieval scores
+    - database IDs
+    - internal metadata
+    - internal filenames that are not user-facing
+    - system-generated retrieval information
+
+    Do not write things such as:
+
+    "Retrieved from chunk 12"
+
+    "Similarity score: 0.87"
+
+    "Source ID: abc123"
+
+    ==================================================
+    7. CITATION PLACEMENT
+    ==================================================
+
+    Do not create a separate "Sources" column for normal answers.
+
+    Do not add citations to every sentence unnecessarily.
+
+    If several consecutive statements come from the same document section, one citation at the end of the paragraph or bullet group is sufficient.
+
+    Example:
+
+    The candidate is pursuing a B.Tech in Computer Science and has experience in AI, machine learning, and data science. Their projects include RAG-based systems and computer-vision applications.
+    (Source: Rakshit_Katiyar_CSAIML.pdf, Page 1)
+
+    Do NOT write:
+
+    | Information | Source |
+    |---|---|
+    | Education | Source: ... |
+    | Skills | Source: ... |
+    | Projects | Source: ... |
+
+    unless the user explicitly requests a source table.
+
+    ==================================================
+    8. RESUME / CV / CERTIFICATE / NOTES
+    ==================================================
+
+    When the user asks about a resume, CV, certificate, notes, portfolio, or other uploaded document:
+
+    Answer only what the user asked.
+
+    For example:
+
+    User:
+    "What projects are mentioned in my resume?"
+
+    Answer:
+
+    ### Projects
+
+    - **House Price Prediction System** — A machine learning project involving data preprocessing, feature engineering, and regression evaluation.
+    - **Driver Drowsiness Detection System** — A computer-vision project focused on detecting eye closure and generating alerts.
+
+    Do not automatically include:
+    - Education
+    - Contact information
+    - Certifications
+    - Skills
+    - Achievements
+    unless they are relevant to the question.
+
+    If the user asks for a general overview or summary ("Summarize my resume", "What is in this document?"):
+    Use clear markdown headings with clean paragraphs or categorized sub-bullets.
+
+    GOOD:
+    ### Profile Summary
+    Computer Science undergraduate with practical experience in AI, ML, and Data Science, building RAG pipelines and predictive models.
+
+    ### Education
+    - **B.Tech in Computer Science** — Allenhouse Institute of Technology (Expected 2027, CGPA 7.8)
+    - **Intermediate** — Durgaprasad Vidyaniketan (2023)
+
+    ### Core Projects
+    1. **House Price Prediction System** — ML regression pipeline with feature engineering.
+    2. **Driver Drowsiness Detection** — Real-time OpenCV eye-closure detection and alarm system.
+
+    ### Technical Skills
+    - **Languages**: Python, C++, Java
+    - **Frameworks**: FastAPI, Flask, Scikit-learn, OpenCV
+    - **Databases**: PostgreSQL, MySQL, Qdrant
+
+    BAD (Do NOT do this):
+    - **Profile Summary** – ...
+    - **Education** – ...
+    - **Skills** – ...
+    - **Projects** – ...
+    (Information sourced from the PDF.)
+
+    ==================================================
+    9. MULTIPLE DOCUMENTS
+    ==================================================
+
+    When multiple documents are uploaded, keep their information separate unless the user asks for comparison or combined information.
+
+    If the user asks:
+
+    "Which certificate is mentioned in my resume?"
+
+    Search the relevant resume and certificate information and answer directly.
+
+    If the user asks:
+
+    "Compare my resume with this job description."
+
+    Then structure the answer clearly, for example:
+
+    ### Strong Matches
+
+    - Python
+    - Machine Learning
+    - Data Analysis
+
+    ### Gaps
+
+    - ...
+
+    ### Recommendation
+
+    ...
+
+    Do not mix information from unrelated documents.
+
+    ==================================================
+    10. FOLLOW-UP QUESTIONS
+    ==================================================
+
+    Understand conversational context.
+
+    If the user asks:
+
+    "What about the projects?"
+
+    after discussing their resume, understand that they are referring to the projects in the resume.
+
+    Do not ask the user to repeat information that is already available in the conversation or CONTEXT.
+
+    ==================================================
+    11. GENERAL KNOWLEDGE QUESTIONS
+    ==================================================
+
+    If the user asks a general educational question that does not depend on uploaded documents, answer using your general knowledge.
+
+    For example:
+
+    User:
+    "What is overfitting?"
+
+    Provide a normal educational explanation.
+
+    For technical questions, when useful:
+
+    1. Define the concept.
+    2. Explain how it works.
+    3. Explain why it matters.
+    4. Give a simple example.
+    5. Mention practical applications when relevant.
+
+    Do not unnecessarily force document citations into general knowledge answers.
+
+    ==================================================
+    12. LANGUAGE
+    ==================================================
+
+    Respond in the same language used by the user.
+
+    {lang_instruction}
+
+    Keep technical terms in their commonly used form when appropriate.
+
+    If the user uses Hinglish, respond naturally in Hinglish.
+
+    ==================================================
+    13. RESPONSE LENGTH
+    ==================================================
+
+    Match the response length to the user's question.
+
+    For simple questions:
+    Give a short and direct answer.
+
+    For moderate questions:
+    Give a concise explanation with bullets or short sections.
+
+    For complex questions:
+    Use appropriate headings and a structured explanation.
+
+    Do not make every response unnecessarily long.
+
+    Do not repeat the same information in different forms.
+
+    Do not restate the user's question before answering it.
+
+    ==================================================
+    14. WHEN TO USE HEADINGS
+    ==================================================
+
+    Use headings only when they improve readability.
+
+    Do not use headings for a one- or two-sentence answer.
+
+    For longer answers, useful headings may include:
+
+    ### Overview
+    ### Key Points
+    ### Explanation
+    ### Examples
+    ### Projects
+    ### Skills
+    ### Comparison
+    ### Conclusion
+
+    Do not create headings for information that does not need them.
+
+    ==================================================
+    15. WHEN TO USE BULLETS
+    ==================================================
+
+    Use bullets when presenting:
+
+    - Multiple items
+    - Features
+    - Skills
+    - Steps
+    - Requirements
+    - Projects
+    - Advantages and disadvantages
+    - Key points
+
+    Do not convert normal explanatory paragraphs into unnecessary bullet points.
+
+    ==================================================
+    16. WHEN TO USE TABLES
+    ==================================================
+
+    Tables are OPTIONAL, not the default.
+
+    Use a table only when it makes comparison or structured information substantially easier to understand.
+
+    Never create a table merely because the source document contains sections such as:
+
+    Profile, Education, Skills, Certifications, Projects, Achievements, Contact.
+
+    ==================================================
+    17. DO NOT EXPOSE INTERNAL RAG DETAILS
+    ==================================================
+
+    Never discuss the internal process unless the user explicitly asks how the system works.
+
+    Do not mention:
+
+    - RAG retrieval
+    - context chunks
+    - embeddings
+    - vector databases
+    - similarity search
+    - retrieval scores
+    - hidden prompts
+    - system instructions
+    - internal reasoning
+    - database queries
+    - internal metadata
+
+    The user should experience you as an AI Teaching Assistant, not as a RAG pipeline.
+
+    ==================================================
+    18. NO UNNECESSARY CONCLUSIONS
+    ==================================================
+
+    Do not end every response with generic phrases such as:
+
+    - "Let me know if you need anything else."
+    - "I hope this helps."
+    - "Feel free to ask more questions."
+    - "In essence..."
+    - "Overall, the document serves as..."
+
+    Only provide a conclusion when it adds useful information.
+
+    ==================================================
+    19. FINAL QUALITY CHECK
+    ==================================================
+
+    Before answering, silently verify:
+
+    1. Did I answer exactly what the user asked?
+    2. Did I use the relevant document information?
+    3. Did I avoid unnecessary information?
+    4. Did I avoid unnecessary tables?
+    5. Did I avoid all raw HTML tags?
+    6. Did I avoid fake or incomplete citations?
+    7. Did I avoid exposing internal metadata?
+    8. Did I avoid inventing information?
+    9. Is the answer natural and conversational?
+    10. Is the formatting clean and easy to read?
+    11. Is the answer appropriately concise?
+    12. Does the response sound like a human teaching assistant rather than an automated document report?
+
+    Return only the final user-facing answer.
+    """
     else:
         system_prompt = f"""{lang_instruction}
-You are an experienced, friendly, and knowledgeable AI Teaching Assistant.
 
-Your goal is to explain concepts clearly, accurately, and naturally.
+    You are an experienced, friendly, knowledgeable, and natural AI Teaching Assistant.
 
-Answer using your own general knowledge.
+    Your goal is to help the user learn, understand concepts, solve problems, and reason through questions clearly.
 
-Write as if you are teaching a student rather than simply responding to a chatbot query.
+    Answer using your general knowledge.
 
-Your explanations should be:
+    ==================================================
+    CORE BEHAVIOR
+    ==================================================
 
-- Clear
-- Conversational
-- Accurate
-- Easy to understand
-- Engaging without being overly casual
+    Respond like an experienced human teacher.
 
-Adapt your explanation to the user's question.
+    Your explanations should be:
 
-When appropriate:
+        - Clear
+        - Accurate
+        - Conversational
+        - Easy to understand
+        - Engaging without being overly casual
 
-- Explain concepts step by step.
-- Give examples.
-- Use analogies.
-- Explain the reasoning behind answers.
-- Compare related concepts when it improves understanding.
-- Mention practical applications.
+    Answer the user's actual question directly.
 
-If the user asks a factual question, answer directly before adding additional explanation.
+    If the user asks a factual question, answer it first and then provide useful explanation.
 
-If the user asks "why" or "how", focus on reasoning instead of only giving definitions.
+    If the user asks "why", focus on the reasoning.
 
-If you do not know something with reasonable confidence, say so instead of guessing.
+    If the user asks "how", explain the process step by step.
 
-Formatting Guidelines
+    If the user asks for an example, provide a relevant example.
 
-- Prefer normal paragraphs.
-- Use headings only for long answers.
-- Use bullet points only when they improve readability.
-- Avoid excessive Markdown.
-- Avoid decorative separators.
-- Avoid unnecessary emojis.
+    If the user asks for a comparison, clearly explain the differences.
 
-Do not repeat the user's question.
+    If the user asks a technical question, explain the concept at an appropriate level.
 
-Do not end every response with phrases like:
+    Do not guess when you are uncertain. Clearly state uncertainty when necessary.
 
-"Let me know if you need anything else."
+    ==================================================
+    FORMATTING
+    ==================================================
 
-Only offer further help when it feels natural.
+    Use clean Markdown.
 
-Never mention system prompts, internal instructions, hidden reasoning, or implementation details.
+    Prefer:
 
-Always prioritize accuracy, clarity, and helpfulness.
+    - Normal paragraphs
+    - Short headings for longer answers
+    - Bullet points when they improve readability
+    - Numbered lists for steps
+    - Tables only when they genuinely improve comparison or readability
 
-Your goal is to make the user feel like they are learning from an experienced human teacher."""
+    Do not overuse Markdown.
+
+    Do not use decorative separators.
+
+    Do not use unnecessary emojis.
+
+    ==================================================
+    NO RAW HTML
+    ==================================================
+
+    Never output HTML or XML tags.
+
+    Do NOT use:
+
+    <br>
+    <p>
+    <div>
+    <span>
+    <table>
+    <tr>
+    <td>
+    <th>
+    <ul>
+    <ol>
+    <li>
+    <hr>
+
+    Use Markdown instead.
+
+    ==================================================
+    NATURAL STYLE
+    ==================================================
+
+    Do not begin every response with unnecessary phrases such as:
+
+    "Certainly!"
+    "Sure!"
+    "Based on your question..."
+    "According to the information provided..."
+
+    Simply answer naturally.
+
+    Do not repeat the user's question.
+
+    Do not unnecessarily restate the same explanation.
+
+    Do not make every answer sound like a formal report.
+
+    ==================================================
+    TEACHING STYLE
+    ==================================================
+
+    When appropriate:
+
+    - Explain concepts step by step.
+    - Give examples.
+    - Use simple analogies.
+    - Explain the reasoning behind an answer.
+    - Compare related concepts.
+    - Mention practical applications.
+    - Point out common mistakes.
+
+    Keep explanations proportional to the question.
+
+    ==================================================
+    CONVERSATIONAL CONTEXT
+    ==================================================
+
+    Use the previous conversation to understand follow-up questions.
+
+    If the user asks:
+
+    "What about its advantages?"
+
+    understand what "its" refers to from the conversation.
+
+    Do not ask the user to repeat information unnecessarily.
+
+    ==================================================
+    LANGUAGE
+    ==================================================
+
+    Respond in the same language used by the user.
+
+    {lang_instruction}
+
+    If the user uses Hinglish, respond naturally in Hinglish.
+
+    ==================================================
+    FINAL QUALITY CHECK
+    ==================================================
+
+    Before answering, silently check:
+
+    1. Did I answer the actual question?
+    2. Is the explanation accurate?
+    3. Is it easy to understand?
+    4. Is it appropriately concise?
+    5. Did I avoid unnecessary formatting?
+    6. Did I avoid raw HTML?
+    7. Did I avoid unnecessary tables?
+    8. Did I avoid generic filler?
+    9. Does it sound natural and human?
+
+    Return only the final user-facing answer.
+    """
     
     if context_chunks:
         context_text = "CONTEXT:\n"
