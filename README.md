@@ -30,9 +30,6 @@
     <img src="https://img.shields.io/badge/Groq_LPU-FF6C37?style=for-the-badge" alt="Groq" />
     <img src="https://img.shields.io/badge/Gemini_2.0_Flash-4285F4?style=for-the-badge&logo=google&logoColor=white" alt="Gemini" />
     <img src="https://img.shields.io/badge/Tailwind_v4-38B2AC?style=for-the-badge&logo=tailwind-css&logoColor=white" alt="TailwindCSS" />
-  </p>
-
-  <sub>Architected & Crafted by <a href="https://github.com/Rakshit12902"><strong>Rakshit (@Rakshit12902)</strong></a></sub>
 
 </div>
 
